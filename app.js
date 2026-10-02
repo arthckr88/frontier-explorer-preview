@@ -46103,16 +46103,36 @@ function flightResults(catalog, query) {
     if (!old || flight.standard || flight.discountDen || flight.goWild) unique.set(key, flight);
   }
   const flights = [...unique.values()].sort((a2, b2) => query.sort === "duration" ? a2.durationMinutes - b2.durationMinutes || a2.departureLocal.localeCompare(b2.departureLocal) : query.sort === "depart" ? a2.departureLocal.localeCompare(b2.departureLocal) : a2.stops - b2.stops || a2.departureLocal.localeCompare(b2.departureLocal));
-  return { ...found, flights, paths: found.paths.filter((path) => path.kind === "possible") };
+  const completeKeys = new Set(flights.filter((flight) => flight.stops === 0).map((flight) => `${flight.flightNumber}|${flight.departureLocal.slice(0, 16)}`));
+  const departures = airportDepartures(catalog, query).filter((flight) => !completeKeys.has(`${flight.flightNumber}|${flight.departureLocal.slice(0, 16)}`));
+  return { ...found, flights, departures, paths: found.paths.filter((path) => path.kind === "possible") };
+}
+function airportDepartures(catalog, query) {
+  if (query.maxDuration != null || query.arrive || query.via || query.layover) return [];
+  return (catalog.airportDepartures ?? []).filter((flight) => {
+    if (flight.origin !== query.origin || flight.destination !== query.destination || flight.date !== query.date) return false;
+    const hour = Number(flight.departureLocal.slice(11, 13));
+    const bucket2 = hour >= 5 && hour < 12 ? "morning" : hour >= 12 && hour < 17 ? "afternoon" : hour >= 17 && hour < 22 ? "evening" : "";
+    if (query.depart && query.depart !== bucket2) return false;
+    return !query.excludeRedEyes || Boolean(bucket2);
+  });
+}
+function airportRoutesUrl(origin) {
+  return origin === "PDX" ? "https://www.flypdx.com/NonstopDestinations" : "https://www.flightconnections.com/route-map-frontier-airlines-f9";
 }
 function flightDates(catalog, query) {
   const candidates = new Set(catalog.network.observations.filter((flight) => flight.origin === query.origin && (query.maxStops > 0 || flight.destination === query.destination)).map((flight) => flight.date));
   for (const fare of catalog.fares) if (fare.origin === query.origin && fare.destination === query.destination && normalizeFareItinerary(fare).completeness === "complete") candidates.add(fare.date);
-  return [...candidates].sort().filter((date) => flightResults(catalog, { ...query, date }).flights.length > 0);
+  for (const flight of catalog.airportDepartures ?? []) if (flight.origin === query.origin && flight.destination === query.destination) candidates.add(flight.date);
+  return [...candidates].sort().filter((date) => {
+    const result = flightResults(catalog, { ...query, date });
+    return result.flights.length > 0 || result.departures.length > 0;
+  });
 }
 function dateStatus(catalog, query) {
   if (query.maxStops > 0 && flightResults(catalog, { ...EMPTY_QUERY, origin: query.origin, destination: query.destination, date: query.date, maxStops: query.maxStops, excludeRedEyes: false }).flights.length) return "captured";
   if (catalog.network.observations.some((flight) => flight.origin === query.origin && flight.destination === query.destination && flight.date === query.date) || catalog.fares.some((fare) => fare.origin === query.origin && fare.destination === query.destination && fare.date === query.date && normalizeFareItinerary(fare).completeness === "complete")) return "captured";
+  if ((catalog.airportDepartures ?? []).some((flight) => flight.origin === query.origin && flight.destination === query.destination && flight.date === query.date)) return "departure_only";
   const checks = catalog.network.checks.filter((check) => check.origin === query.origin && check.destination === query.destination && check.date === query.date);
   if (checks.some((check) => check.state === "checked_empty")) return "empty";
   if (checks.some((check) => check.state === "blocked")) return "unavailable";
@@ -46121,7 +46141,8 @@ function dateStatus(catalog, query) {
 function suggestedFlights(catalog, today = calendarToday()) {
   const pairs = /* @__PURE__ */ new Map();
   for (const flight of [...catalog.network.observations].sort((a2, b2) => a2.date.localeCompare(b2.date))) if (flight.date >= today && !pairs.has(`${flight.origin}|${flight.destination}`)) pairs.set(`${flight.origin}|${flight.destination}`, { origin: flight.origin, destination: flight.destination, date: flight.date });
-  const preferred = ["OAK", "SFO", "LAS", "DEN"];
+  for (const flight of catalog.airportDepartures ?? []) if (flight.date > today && !pairs.has(`${flight.origin}|${flight.destination}`)) pairs.set(`${flight.origin}|${flight.destination}`, { origin: flight.origin, destination: flight.destination, date: flight.date });
+  const preferred = ["PDX", "OAK", "SFO", "LAS", "DEN"];
   return [...pairs.values()].sort((a2, b2) => (preferred.indexOf(a2.origin) < 0 ? 99 : preferred.indexOf(a2.origin)) - (preferred.indexOf(b2.origin) < 0 ? 99 : preferred.indexOf(b2.origin))).slice(0, 6);
 }
 function resolveAirport(catalog, value) {
@@ -46183,13 +46204,16 @@ function Shell({ children, status, links }) {
 
 // src/gh-pages/load-browser.ts
 async function loadCatalogBrowser() {
-  const [network, fareFile, changes, historyText, airports, historical] = await Promise.all([
-    fetch("network.json").then((response) => response.json()),
-    fetch("browser-fares.json").then((response) => response.json()),
-    fetch("route-changes.json").then((response) => response.json()),
-    fetch("price-history.jsonl").then((response) => response.text()),
-    fetch("airports.json").then((response) => response.json()),
-    fetch("historical-metrics.json").then((response) => response.ok ? response.json() : null)
+  const version = new URL(import.meta.url).searchParams.get("v");
+  const dataUrl = (name) => version ? `${name}?v=${encodeURIComponent(version)}` : name;
+  const [network, fareFile, changes, historyText, airports, historical, airportDepartures2] = await Promise.all([
+    fetch(dataUrl("network.json")).then((response) => response.json()),
+    fetch(dataUrl("browser-fares.json")).then((response) => response.json()),
+    fetch(dataUrl("route-changes.json")).then((response) => response.json()),
+    fetch(dataUrl("price-history.jsonl")).then((response) => response.text()),
+    fetch(dataUrl("airports.json")).then((response) => response.json()),
+    fetch(dataUrl("historical-metrics.json")).then((response) => response.ok ? response.json() : null),
+    fetch(dataUrl("airport-departures.json")).then((response) => response.json())
   ]);
   const priceHistory = historyText.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => JSON.parse(line));
   return {
@@ -46198,7 +46222,8 @@ async function loadCatalogBrowser() {
     changes,
     priceHistory,
     airports,
-    historical
+    historical,
+    airportDepartures: airportDepartures2
   };
 }
 
@@ -46409,7 +46434,7 @@ function DiscoverView({ catalog, from = "" }) {
   return /* @__PURE__ */ (0, import_jsx_runtime6.jsxs)("section", { className: "space-y-4", children: [
     /* @__PURE__ */ (0, import_jsx_runtime6.jsxs)("header", { children: [
       /* @__PURE__ */ (0, import_jsx_runtime6.jsx)("h1", { className: "text-2xl font-medium", children: "Discover" }),
-      /* @__PURE__ */ (0, import_jsx_runtime6.jsx)("p", { className: "max-w-2xl text-sm text-[#8b9790]", children: "Every Frontier airport and direct route in the official catalogue. A candidate market is not listed here as a nonstop." })
+      /* @__PURE__ */ (0, import_jsx_runtime6.jsx)("p", { className: "max-w-2xl text-sm text-[#8b9790]", children: "Verified Frontier nonstops and captured flight times. The route list is incomplete; use the full route map for airports without results." })
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime6.jsxs)("form", { className: "grid gap-2 sm:grid-cols-2 lg:grid-cols-4", children: [
       /* @__PURE__ */ (0, import_jsx_runtime6.jsx)("input", { "aria-label": "Search airports and routes", value: filters.query, placeholder: "City or airport", onChange: (event) => setFilters({ ...filters, query: event.target.value }), className: field }),
@@ -46658,7 +46683,7 @@ var import_react7 = __toESM(require_react());
 // src/components/explorer-map.tsx
 var import_react4 = __toESM(require_react());
 var import_jsx_runtime10 = __toESM(require_jsx_runtime());
-function ExplorerMap({ tileStyle, routes, airports, interest, focusAirport = null, selected = null, selectedPath = [], onAirportClick, onRouteClick }) {
+function ExplorerMap({ tileStyle, routes, airports, interest, focusAirport = null, selected = null, selectedPath = [], selectionLabel = "Selected flight", onAirportClick, onRouteClick }) {
   const container = (0, import_react4.useRef)(null);
   const mapRef = (0, import_react4.useRef)(null);
   const fitRef = (0, import_react4.useRef)(() => {
@@ -46867,7 +46892,8 @@ function ExplorerMap({ tileStyle, routes, airports, interest, focusAirport = nul
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime10.jsxs)("span", { children: [
         /* @__PURE__ */ (0, import_jsx_runtime10.jsx)("span", { className: "text-[#e8ffb0]", children: "\u2501" }),
-        " Selected flight"
+        " ",
+        selectionLabel
       ] })
     ] })
   ] });
@@ -47060,33 +47086,15 @@ function FlightResults({ catalog, query, selectedId, onSelect, onSearch, setting
   ] });
   const from = catalog.airports.find((airport) => airport.iata === query.origin);
   const to3 = catalog.airports.find((airport) => airport.iata === query.destination);
-  if (!query.date || !query.destination) {
-    const groups = staticDiscover(catalog, query.origin, query.maxStops).groups;
-    return /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "space-y-4 p-4", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("header", { children: [
-        /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("h2", { className: "text-lg font-medium", children: [
-          "From ",
-          from?.city || query.origin
-        ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "text-xs text-[#8b9790]", children: "Explore routes, then choose a destination and date to find flights." })
-      ] }),
-      groups.map((group) => /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("section", { children: [
-        /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("h3", { className: "mb-2 text-xs font-medium text-[#8b9790]", children: group.stop === 0 ? "Nonstop destinations" : `Reachable with ${group.stop} stop${group.stop > 1 ? "s" : ""}` }),
-        /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("div", { className: "space-y-1", children: group.items.filter((item) => !query.destination || item.iata === query.destination).map((item) => /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("button", { type: "button", onClick: () => onSearch({ ...query, destination: item.iata, date: today }), className: "flex w-full justify-between rounded border border-[#24302a] px-3 py-2 text-left text-sm hover:border-[#3dbe7a]", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("span", { children: item.city }),
-          /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("span", { className: "font-mono text-[#3dbe7a]", children: item.iata })
-        ] }, item.iata)) })
-      ] }, group.stop)),
-      query.destination ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("a", { href: scheduleSourceUrl(query.origin, query.destination), target: "_blank", rel: "noopener noreferrer", className: "block rounded bg-[#3dbe7a] px-3 py-2 text-center text-sm text-[#090b0d]", children: "Check airlines serving this route \u2197" }) : null,
-      /* @__PURE__ */ (0, import_jsx_runtime12.jsx)(AppLink, { href: `/airports/${query.origin}`, className: "block text-sm text-[#3dbe7a]", children: "Airport details \u2192" })
-    ] });
-  }
+  if (!query.date || !query.destination) return /* @__PURE__ */ (0, import_jsx_runtime12.jsx)(RouteResults, { catalog, query, onSearch });
   const flights = result?.flights ?? [];
+  const departures = result?.departures ?? [];
+  const hasResults = flights.length > 0 || departures.length > 0;
   const state = dateStatus(catalog, query);
   const legs = [...new Map(flights.flatMap((flight) => flight.segments ?? []).map((leg) => [`${leg.origin}|${leg.destination}`, leg])).values()];
   const upcoming = dates.filter((date) => date >= today);
   const past = dates.filter((date) => date < today);
-  const emptyMessage = state === "captured" ? "No complete flights match these filters." : state === "empty" ? "Frontier returned no nonstop flights when this date was checked. Try another date or allow connections." : state === "unavailable" ? "The last flight check could not be completed. Check this date directly with Frontier." : query.maxStops === 0 && !result?.officialNonstop ? "No Frontier nonstop has been verified for this route. Flight schedules for this date are unavailable here." : "No verified flight schedule is available here for this route and date. Check Frontier for current flights.";
+  const emptyMessage = state === "captured" ? "No complete flights match these filters." : state === "departure_only" ? "The airport supplies departure times, but no arrival times or trip durations. Clear filters to see the available departures." : state === "empty" ? "Frontier returned no nonstop flights when this date was checked. Try another date or allow connections." : state === "unavailable" ? "The last flight check could not be completed. Check this date directly with Frontier." : query.maxStops === 0 && !result?.officialNonstop ? "No Frontier nonstop has been verified for this route. Flight schedules for this date are unavailable here." : "No verified flight schedule is available here for this route and date. Check Frontier for current flights.";
   return /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { id: "results", className: "space-y-3 p-3", "aria-live": "polite", children: [
     /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("header", { children: [
       /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("h2", { className: "text-lg font-medium", children: [
@@ -47104,20 +47112,24 @@ function FlightResults({ catalog, query, selectedId, onSelect, onSearch, setting
     ] }),
     query.date < today ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "rounded border border-[#e2a84a]/40 bg-[#e2a84a]/5 px-2 py-1.5 text-xs text-[#e2a84a]", children: "Past flight date \xB7 prices below are historical." }) : null,
     /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "flex items-center justify-between gap-2", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "text-xs text-[#aab6ae]", children: flights.length ? `${flights.length} flight option${flights.length === 1 ? "" : "s"}` : state === "missing" || state === "unavailable" ? "Schedule unavailable" : "No matching captured flights" }),
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "text-xs text-[#aab6ae]", children: flights.length + departures.length ? `${flights.length + departures.length} captured flight${flights.length + departures.length === 1 ? "" : "s"}` : state === "missing" || state === "unavailable" ? "Schedule unavailable" : "No matching captured flights" }),
       /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("select", { "aria-label": "Sort results", value: query.sort, onChange: (event) => onSearch({ ...query, sort: event.target.value }), className: "min-w-0 rounded border border-[#304037] bg-[#090b0d] px-2 py-1.5 text-xs", children: [
         /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("option", { value: "stops", children: "Fewest stops" }),
         /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("option", { value: "duration", children: "Shortest trip" }),
         /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("option", { value: "depart", children: "Earliest departure" })
       ] })
     ] }),
-    flights.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "space-y-2 rounded-md border border-[#24302a] p-3 text-sm", children: [
+    !hasResults ? /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "space-y-2 rounded-md border border-[#24302a] p-3 text-sm", children: [
       /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { children: emptyMessage }),
-      result?.officialNonstop ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "text-xs text-[#8b9790]", children: "Frontier has explicit nonstop service evidence for this route, but no flight is confirmed here for your date." }) : null,
+      result?.officialNonstop ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "text-xs text-[#8b9790]", children: "An official source lists this nonstop route, but no flight is confirmed here for your date." }) : null,
       query.maxStops === 0 ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("button", { type: "button", className: "block text-[#3dbe7a]", onClick: () => onSearch({ ...query, maxStops: 1 }), children: "Include connections" }) : null,
-      state === "captured" ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("button", { type: "button", className: "text-[#3dbe7a]", onClick: () => onSearch({ ...EMPTY_QUERY, origin: query.origin, destination: query.destination, date: query.date, maxStops: query.maxStops, excludeRedEyes: false }), children: "Clear flight filters" }) : null
+      state === "captured" || state === "departure_only" ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("button", { type: "button", className: "text-[#3dbe7a]", onClick: () => onSearch({ ...EMPTY_QUERY, origin: query.origin, destination: query.destination, date: query.date, maxStops: query.maxStops, excludeRedEyes: false }), children: "Clear flight filters" }) : null
     ] }) : null,
     flights.map((flight) => /* @__PURE__ */ (0, import_jsx_runtime12.jsx)(FlightCard, { flight, selected: selectedId === flight.id, onSelect: () => onSelect(flight), fareMode: settings.fareMode }, flight.id)),
+    departures.length ? /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "space-y-2", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "text-xs text-[#8b9790]", children: "Departure times from the official airport flight board. Arrival times and prices are not supplied." }),
+      departures.map((departure) => /* @__PURE__ */ (0, import_jsx_runtime12.jsx)(DepartureCard, { departure }, `${departure.flightNumber}${departure.departureLocal}`))
+    ] }) : null,
     upcoming.length ? /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { children: [
       /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("h3", { className: "mb-1.5 text-xs text-[#8b9790]", children: "Other dates with matching flight times" }),
       /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("div", { className: "flex flex-wrap gap-1.5", children: upcoming.slice(0, 12).map((date) => /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("button", { type: "button", "aria-pressed": date === query.date, onClick: () => onSearch({ ...query, date }), className: `rounded border px-2 py-1.5 text-xs ${date === query.date ? "border-[#3dbe7a] text-[#3dbe7a]" : "border-[#304037]"}`, children: formatDay(date).replace(/, \d{4}$/, "") }, date)) })
@@ -47152,6 +47164,79 @@ function FlightResults({ catalog, query, selectedId, onSelect, onSearch, setting
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("a", { href: frontierSearchUrl(), target: "_blank", rel: "noopener noreferrer", className: "block rounded-md border border-[#3dbe7a]/50 px-3 py-2 text-center text-sm text-[#3dbe7a]", children: "Confirm prices on Frontier \u2197" }),
     /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "text-[11px] leading-relaxed text-[#8b9790]", children: "Local airport times. Flight options use captured schedules; prices apply only to the date shown. Confirm the flight and any connection with Frontier." })
+  ] });
+}
+function RouteResults({ catalog, query, onSearch }) {
+  const today = calendarToday();
+  const from = catalog.airports.find((airport) => airport.iata === query.origin);
+  const groups = staticDiscover(catalog, query.origin, query.maxStops).groups.map((group) => ({ ...group, items: group.items.filter((item) => !query.destination || item.iata === query.destination) })).filter((group) => group.items.length);
+  const count = groups.reduce((sum, group) => sum + group.items.length, 0);
+  const evidence = (catalog.network.official?.routes ?? []).filter((route) => route.origin === query.origin);
+  const sources = [...new Set(evidence.map((route) => route.sourceUrl))];
+  return /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "space-y-4 p-4", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("header", { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("h2", { className: "text-lg font-medium", children: [
+        "From ",
+        from?.city || query.origin
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "mt-1 text-xs text-[#8b9790]", children: count ? `${count} destination${count === 1 ? "" : "s"} with route data. Select a destination to see its route.` : "Routes for this airport aren\u2019t available in this app yet. This does not mean Frontier has no routes." })
+    ] }),
+    groups.map((group) => /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("section", { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("h3", { className: "mb-2 text-xs font-medium text-[#8b9790]", children: group.stop === 0 ? "Nonstop destinations" : `Possible paths with ${group.stop} stop${group.stop > 1 ? "s" : ""}` }),
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("div", { className: "space-y-2", children: group.items.map((item) => {
+        const route = evidence.find((route2) => route2.destination === item.iata);
+        const next = flightDates(catalog, { ...query, destination: item.iata, date: today }).find((date) => date >= today);
+        return /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("article", { className: "rounded border border-[#24302a] p-2.5", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("button", { type: "button", "aria-label": `Explore ${query.origin} to ${item.iata}`, onClick: () => onSearch({ ...query, destination: item.iata, date: "" }), className: "flex w-full justify-between text-left text-sm", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("span", { children: item.city }),
+            /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("span", { className: "font-mono text-[#3dbe7a]", children: item.iata })
+          ] }),
+          route?.seasonal ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "mt-1 text-[11px] text-[#e2a84a]", children: "Seasonal service \xB7 check your date" }) : null,
+          /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "mt-2 flex flex-wrap gap-3 text-xs", children: [
+            next ? /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("button", { type: "button", onClick: () => onSearch({ ...query, destination: item.iata, date: next }), className: "text-[#3dbe7a]", children: [
+              "Show ",
+              formatDay(next).replace(/, \d{4}$/, ""),
+              " departures"
+            ] }) : null,
+            /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("a", { href: scheduleSourceUrl(query.origin, item.iata), target: "_blank", rel: "noopener noreferrer", className: "text-[#aab6ae]", children: "Check timetable \u2197" })
+          ] })
+        ] }, item.iata);
+      }) })
+    ] }, group.stop)),
+    !count ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("a", { href: airportRoutesUrl(query.origin), target: "_blank", rel: "noopener noreferrer", className: "block rounded bg-[#3dbe7a] px-3 py-2.5 text-center text-sm font-medium text-[#090b0d]", children: "Check Frontier\u2019s full route map \u2197" }) : null,
+    count ? /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "text-[11px] leading-relaxed text-[#8b9790]", children: "Routes are separate from flights on a specific date. Connection paths require each leg\u2019s timetable to line up." }) : null,
+    sources.map((source) => /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("a", { href: source, target: "_blank", rel: "noopener noreferrer", className: "block text-xs text-[#3dbe7a]", children: [
+      source.includes("flypdx.com") ? "Source: Portland airport\u2019s nonstop map" : "Source: official nonstop listing",
+      " \u2197"
+    ] }, source)),
+    /* @__PURE__ */ (0, import_jsx_runtime12.jsx)(AppLink, { href: `/airports/${query.origin}`, className: "block text-sm text-[#3dbe7a]", children: "Airport details \u2192" })
+  ] });
+}
+function DepartureCard({ departure }) {
+  return /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("article", { "data-flight": departure.flightNumber, "data-date": departure.date, className: "rounded-lg border border-[#24302a] bg-[#12161b] p-3", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("div", { className: "flex justify-between text-xs text-[#8b9790]", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("span", { children: [
+        "F9 ",
+        departure.flightNumber
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("span", { children: departure.status === "departed" ? "Departed" : "Scheduled departure" })
+    ] }),
+    /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("p", { className: "mt-1 text-lg font-medium", children: [
+      clock(departure.departureLocal),
+      " ",
+      /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("span", { className: "text-xs font-normal text-[#8b9790]", children: "departure" })
+    ] }),
+    /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("p", { className: "font-mono text-xs text-[#8b9790]", children: [
+      departure.origin,
+      " \u2192 ",
+      departure.destination
+    ] }),
+    /* @__PURE__ */ (0, import_jsx_runtime12.jsx)("p", { className: "mt-2 text-xs text-[#8b9790]", children: "Arrival time and price unavailable." }),
+    /* @__PURE__ */ (0, import_jsx_runtime12.jsxs)("a", { href: departure.sourceUrl, target: "_blank", rel: "noopener noreferrer", className: "mt-2 block text-[11px] text-[#3dbe7a]", children: [
+      "Official airport flight board \xB7 checked ",
+      formatChecked(departure.retrievedAt),
+      " \u2197"
+    ] })
   ] });
 }
 function FlightCard({ flight, selected, onSelect, fareMode }) {
@@ -47237,9 +47322,11 @@ function HomeView({ catalog, network, initial }) {
     }
     window.dispatchEvent(new Event("frontier-search"));
   }, [initial]);
-  const options = (0, import_react7.useMemo)(() => query?.destination && query.date ? flightResults(catalog, query).flights : [], [catalog, query]);
+  const result = (0, import_react7.useMemo)(() => query?.destination && query.date ? flightResults(catalog, query) : null, [catalog, query]);
+  const options = result?.flights ?? [];
   const flight = selectedFlight && options.some((option) => option.id === selectedFlight.id) ? selectedFlight : options[0] ?? null;
-  const selectedAirports = flight ? [flight.origin, ...(flight.segments ?? []).map((segment) => segment.destination)] : query?.destination && !query.date && network.routes.some((route) => route.origin === query.origin && route.destination === query.destination) ? [query.origin, query.destination] : [];
+  const departure = !flight ? result?.departures[0] : null;
+  const selectedAirports = flight ? [flight.origin, ...(flight.segments ?? []).map((segment) => segment.destination)] : departure ? [departure.origin, departure.destination] : query?.destination && !query.date && network.routes.some((route) => route.origin === query.origin && route.destination === query.destination) ? [query.origin, query.destination] : [];
   function search(next) {
     setQuery(next);
     setSelectedFlight(null);
@@ -47270,7 +47357,7 @@ function HomeView({ catalog, network, initial }) {
         setSelectedFlight(next);
         setMobileView("map");
       }, onSearch: search }) }),
-      /* @__PURE__ */ (0, import_jsx_runtime13.jsx)("div", { className: `${mobileView === "map" ? "block" : "hidden"} h-[max(24rem,calc(100dvh-22rem))] min-w-0 lg:block lg:h-[calc(100dvh-16rem)] lg:min-h-[20rem]`, children: /* @__PURE__ */ (0, import_jsx_runtime13.jsx)(ExplorerMap, { tileStyle: network.tileStyle, routes: network.routes, airports: network.airports, interest: network.interest, focusAirport, selected: query?.destination ? { origin: query.origin, destination: query.destination } : null, selectedPath: selectedAirports, onAirportClick: airportClick, onRouteClick: (origin, destination) => search({ ...EMPTY_QUERY, origin, destination, date: query?.date || "", maxStops: settings.maxStops }) }) })
+      /* @__PURE__ */ (0, import_jsx_runtime13.jsx)("div", { className: `${mobileView === "map" ? "block" : "hidden"} h-[max(24rem,calc(100dvh-22rem))] min-w-0 lg:block lg:h-[calc(100dvh-16rem)] lg:min-h-[20rem]`, children: /* @__PURE__ */ (0, import_jsx_runtime13.jsx)(ExplorerMap, { tileStyle: network.tileStyle, routes: network.routes, airports: network.airports, interest: network.interest, focusAirport, selected: query?.destination ? { origin: query.origin, destination: query.destination } : null, selectedPath: selectedAirports, selectionLabel: query?.date ? departure ? "Selected departure" : "Selected flight" : "Selected route", onAirportClick: airportClick, onRouteClick: (origin, destination) => search({ ...EMPTY_QUERY, origin, destination, date: query?.date || "", maxStops: settings.maxStops }) }) })
     ] })
   ] });
 }
